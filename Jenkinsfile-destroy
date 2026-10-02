@@ -1,0 +1,130 @@
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        TF_DIR = 'terraform'
+        TF_IN_AUTOMATION = 'true'
+        DEPLOY_ENV = ''
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Determine Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == 'develop') {
+                        env.DEPLOY_ENV = 'dev'
+                    }
+                    else if (env.BRANCH_NAME == 'qa') {
+                        env.DEPLOY_ENV = 'qa'
+                    }
+                    else if (env.BRANCH_NAME == 'main') {
+                        env.DEPLOY_ENV = 'prod'
+                    }
+                    else {
+                        error("Unsupported branch: ${env.BRANCH_NAME}. Destroy is allowed only from develop, qa, or main.")
+                    }
+
+                    echo "Git Branch  : ${env.BRANCH_NAME}"
+                    echo "Destroy Env : ${env.DEPLOY_ENV}"
+                }
+            }
+        }
+
+        stage('AWS Identity Check') {
+            steps {
+                sh '''
+                    set -e
+                    aws --version
+                    aws sts get-caller-identity
+                '''
+            }
+        }
+
+        stage('Terraform Version') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh 'terraform version'
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        terraform init \
+                        -reconfigure \
+                        -backend-config=environments/${env.DEPLOY_ENV}/backend.hcl
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh 'terraform validate'
+                }
+            }
+        }
+
+        stage('Terraform Destroy Plan') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        rm -f tfplan-destroy
+                        terraform plan \
+                        -destroy \
+                        -var-file=environments/${env.DEPLOY_ENV}/terraform.tfvars \
+                        -out=tfplan-destroy
+                    """
+                }
+            }
+        }
+
+        stage('Destroy Approval') {
+            steps {
+                input(
+                    message: "Destroy ALL ${env.DEPLOY_ENV} Terraform-managed infrastructure in AWS?",
+                    ok: "Destroy ${env.DEPLOY_ENV.toUpperCase()}"
+                )
+            }
+        }
+
+        stage('Destroy Infrastructure') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh 'terraform apply -auto-approve tfplan-destroy'
+                }
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "Terraform infrastructure destruction for ${env.DEPLOY_ENV} completed successfully."
+        }
+
+        failure {
+            echo "Terraform infrastructure destruction for ${env.DEPLOY_ENV} failed. Check the Jenkins console output."
+        }
+
+        always {
+            echo "Terraform destroy pipeline for ${env.DEPLOY_ENV} finished."
+        }
+    }
+}

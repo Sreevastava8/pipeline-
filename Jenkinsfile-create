@@ -1,0 +1,198 @@
+pipeline {
+    agent any
+
+    options {
+    disableConcurrentBuilds()
+    timestamps()
+}
+    environment {
+        TF_DIR = 'terraform'
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        TF_IN_AUTOMATION = 'true'
+        DEPLOY_ENV = ''
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Determine Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == 'develop') {
+                        env.DEPLOY_ENV = 'dev'
+                    }
+                    else if (env.BRANCH_NAME == 'qa') {
+                        env.DEPLOY_ENV = 'qa'
+                    }
+                    else if (env.BRANCH_NAME == 'main') {
+                        env.DEPLOY_ENV = 'prod'
+                    }
+                    else {
+                        error("Unsupported branch: ${env.BRANCH_NAME}")
+                    }
+                    echo "Git Branch       : ${env.BRANCH_NAME}"
+                    echo "Deployment Env   : ${env.DEPLOY_ENV}"
+                }
+            }
+        }
+
+        stage('AWS Identity Check') {
+            steps {
+                sh '''
+                    set -e
+                    aws --version
+                    echo "AWS Identity:"
+                    aws sts get-caller-identity
+                '''
+            }
+        }
+
+        stage('Terraform Version') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh 'terraform version'
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        terraform init \
+                        -reconfigure \
+                        -backend-config=environments/${env.DEPLOY_ENV}/backend.hcl
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Format Check') {
+            steps {
+                 sh '''
+                    set -e
+                    echo "Checking Terraform formatting..."
+                    terraform fmt -check -recursive
+                    echo "Terraform formatting check passed."
+                '''
+            }
+        }
+
+        stage('Terraform Validate') {
+            steps {
+                sh '''
+                    set -e
+                    echo "Validating Terraform configuration..."
+                    terraform validate
+                    echo "Terraform validation passed."
+                '''
+            }
+        }
+
+        stage('TFLint Scan') {
+            steps {
+                sh '''
+                    set -e
+                    echo "Running TFLint..."
+                    tflint --init
+                    tflint --recursive
+                    echo "TFLint scan passed."
+                '''
+            }
+        }
+
+        stage('Checkov Security Scan') {
+            steps {
+                sh '''
+                    set -e
+                    echo "Running Checkov security scan..."
+                    checkov \
+                        -d . \
+                        --framework terraform \
+                        --quiet
+                    echo "Checkov security scan passed."
+                '''
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        terraform plan \
+                        -var-file=environments/${env.DEPLOY_ENV}/terraform.tfvars \
+                        -out=tfplan
+                    """
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'qa'
+                }
+            }
+
+            steps {
+                dir("${TF_DIR}") {
+                    sh 'terraform apply -auto-approve tfplan'
+                }
+            }
+        }
+
+        stage('Production Approval') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                input(
+                    message: 'Terraform plan for PROD is ready. Do you want to deploy to production?',
+                    ok: 'Deploy to PROD'
+                )
+            }
+        }
+
+        stage('Production Apply') {
+            when {
+                branch 'main'
+            }
+
+            steps {
+                dir("${TF_DIR}") {
+                    sh 'terraform apply -auto-approve tfplan'
+                }
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo """
+            Terraform deployment completed successfully.
+
+            Git Branch     : ${env.BRANCH_NAME}
+            Environment    : ${env.DEPLOY_ENV}
+            """
+        }
+
+        failure {
+            echo """
+            Terraform deployment failed.
+
+            Git Branch     : ${env.BRANCH_NAME}
+            Environment    : ${env.DEPLOY_ENV}
+
+            Check the Jenkins console logs.
+            """
+        }
+    }
+}
